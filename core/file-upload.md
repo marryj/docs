@@ -165,6 +165,42 @@ final class CreateMediaObjectAction
 }
 ```
 
+## Handling Multiple File Upload
+
+Create an array of MediaObject entities.
+
+```php
+<?php
+// api/src/Controller/CreateMediaObjectAction.php
+
+namespace App\Controller;
+
+use App\Entity\MediaObject;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+
+final class CreateMediaObjectAction
+{
+    public function __invoke(Request $request): MediaObject
+    {
+        $mediaObjectArr = [];
+        $uploadedFile = $request->files->get('file');
+        
+        if (!$uploadedFile) {
+            throw new BadRequestHttpException('"file" is required');
+        }
+
+        foreach($uploadedFile as $file) {
+            $mediaObject = new MediaObject();
+            $mediaObject->setFile($file);
+            $mediaObjectArr[] = $mediaObject;
+        }
+
+        return $mediaObjectArr;
+    }
+}
+```
+
 ## Resolving the File URL
 
 Returning the plain file path on the filesystem where the file is stored is not useful for the client, which needs a
@@ -233,12 +269,85 @@ final class ResolveMediaObjectContentUrlSubscriber implements EventSubscriberInt
 }
 ```
 
+## Resolving multiple File URLs
+
+```php
+<?php
+// api/src/EventSubscriber/ResolveMediaObjectContentUrlSubscriber.php
+
+namespace App\EventSubscriber;
+
+use ApiPlatform\Core\EventListener\EventPriorities;
+use ApiPlatform\Core\Util\RequestAttributesExtractor;
+use App\Entity\MediaObject;
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Event\ViewEvent;
+use Symfony\Component\HttpKernel\KernelEvents;
+use Vich\UploaderBundle\Storage\StorageInterface;
+use Doctrine\ORM\EntityManagerInterface;
+
+final class ResolveMediaObjectContentUrlSubscriber implements EventSubscriberInterface
+{
+    private $storage;
+    
+    /**
+     * @var EntityManagerInterface
+     */
+    private $em;
+
+    public function __construct(StorageInterface $storage, EntityManagerInterface $em)
+    {
+        $this->storage = $storage;
+        $this->em = $em;
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            KernelEvents::VIEW => ['onPreSerialize', EventPriorities::PRE_SERIALIZE],
+        ];
+    }
+
+    public function onPreSerialize(ViewEvent $event): void
+    {
+        $controllerResult = $event->getControllerResult();
+        $request = $event->getRequest();
+
+        if ($controllerResult instanceof Response || !$request->attributes->getBoolean('_api_respond', true)) {
+            return;
+        }
+
+        if (!($attributes = RequestAttributesExtractor::extractAttributes($request)) || !\is_a($attributes['resource_class'], MediaObject::class, true)) {
+            return;
+        }
+
+        $mediaObjects = $controllerResult;
+
+        if (!is_iterable($mediaObjects)) {
+            $mediaObjects = [$mediaObjects];
+        }
+
+        foreach ($mediaObjects as $mediaObject) {
+            if (!$mediaObject instanceof MediaObject) {
+                continue;
+            }
+
+            // Persist triggers prePersist event, which triggers Vich file upload. If the upload succeeds, you can resole file Uri
+            $this->em->persist($mediaObject);
+            $mediaObject->contentUrl = $this->storage->resolveUri($mediaObject, 'file');
+            $this->em->flush();
+        }
+    }
+}
+```
+
 ## Making a Request to the `/media_objects` Endpoint
 
 Your `/media_objects` endpoint is now ready to receive a `POST` request with a
 file. This endpoint accepts standard `multipart/form-data`-encoded data, but
-not JSON data. You will need to format your request accordingly. After posting
-your data, you will get a response looking like this:
+not JSON data. You will need to format your request accordingly. If you want to post multiple files, set file parameter as array in the request (file[]) 
+After posting your data, you will get a response looking like this:
 
 ```json
 {
